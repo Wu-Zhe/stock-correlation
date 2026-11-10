@@ -7,7 +7,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -24,9 +23,10 @@ import java.util.zip.ZipFile;
  * Usage:
  *   java -jar stock-extractor.jar -z d_us_txt.zip [-o outDir] [-p] AAPL MSFT,TSLA ...
  *
- * A zip entry matches ticker T when its file name (last path segment) starts
- * with T followed by '.', e.g. "data/daily/us/nasdaq etfs/aaxj.us.txt" -> "aaxj".
- * Matching is case-insensitive and exact, so "abi" does not match "abig.us.txt".
+ * A zip entry matches ticker T when its file name minus ".us.txt" equals T,
+ * e.g. "data/daily/us/nasdaq etfs/aaxj.us.txt" -> "aaxj". Matching is
+ * case-insensitive and exact ("abi" does not match "abig.us.txt"), and '.' is
+ * treated as '-' so share-class tickers like BRK.B match "brk-b.us.txt".
  */
 public final class StockExtractor {
 
@@ -63,15 +63,12 @@ public final class StockExtractor {
                 case "-z", "--zip" -> zipPath = Paths.get(requireValue(args, ++i, a));
                 case "-o", "--out" -> outDir = Paths.get(requireValue(args, ++i, a));
                 case "-p", "--preserve-paths" -> preservePaths = true;
+                case "-f", "--tickers-file" -> addAll(tickers, Files.readString(Paths.get(requireValue(args, ++i, a))));
                 default -> {
                     if (a.startsWith("-")) {
                         throw new IllegalArgumentException("Unknown option: " + a);
                     }
-                    // Accept "AAPL", "AAPL,MSFT" or any mix.
-                    Arrays.stream(a.split("[,\\s]+"))
-                            .map(s -> s.trim().toLowerCase(Locale.ROOT))
-                            .filter(s -> !s.isEmpty())
-                            .forEach(tickers::add);
+                    addAll(tickers, a); // "AAPL", "AAPL,MSFT" or any mix
                 }
             }
         }
@@ -82,12 +79,11 @@ public final class StockExtractor {
             throw new IllegalArgumentException("Zip file not found: " + zipPath);
         }
 
-        List<Path> written = extract(zipPath, outDir, tickers, preservePaths);
+        Set<String> matched = new HashSet<>();
+        List<Path> written = extract(zipPath, outDir, tickers, preservePaths, matched);
 
-        Set<String> found = new HashSet<>();
-        for (Path p : written) found.add(tickerOf(p.getFileName().toString()));
         List<String> missing = new ArrayList<>();
-        for (String t : tickers) if (!found.contains(t)) missing.add(t);
+        for (String t : tickers) if (!matched.contains(t)) missing.add(t);
 
         System.out.printf("Extracted %d file(s) to %s%n", written.size(), outDir.toAbsolutePath());
         if (!missing.isEmpty()) {
@@ -103,8 +99,8 @@ public final class StockExtractor {
      * file), so entries that don't match are never decompressed - only the
      * requested tickers cost any inflate time or disk space.
      */
-    static List<Path> extract(Path zipPath, Path outDir, Set<String> tickers, boolean preservePaths)
-            throws IOException {
+    static List<Path> extract(Path zipPath, Path outDir, Set<String> tickers, boolean preservePaths,
+                              Set<String> matched) throws IOException {
         Path root = outDir.toAbsolutePath().normalize();
         Files.createDirectories(root);
 
@@ -119,7 +115,9 @@ public final class StockExtractor {
 
                 String entryName = entry.getName();
                 String baseName = entryName.substring(entryName.lastIndexOf('/') + 1);
-                if (!tickers.contains(tickerOf(baseName))) continue;
+                String ticker = tickerOf(baseName);
+                if (!tickers.contains(ticker)) continue;
+                matched.add(ticker);
 
                 Path target = resolveTarget(root, entryName, baseName, preservePaths, usedTargets);
                 Files.createDirectories(target.getParent());
@@ -155,11 +153,32 @@ public final class StockExtractor {
         return target;
     }
 
-    /** "aaxj.us.txt" -> "aaxj" (lower-cased). */
+    /**
+     * "aaxj.us.txt" -> "aaxj"; "brk-b.us.txt" -> "brk-b".
+     * Strips ".txt" and the ".us" market suffix, lower-cases, and treats '.' as '-'
+     * so that "BRK.B" (index notation) matches the "brk-b" file name used in the data.
+     */
     static String tickerOf(String fileName) {
-        String lower = fileName.toLowerCase(Locale.ROOT);
-        int dot = lower.indexOf('.');
-        return dot < 0 ? lower : lower.substring(0, dot);
+        String s = fileName.toLowerCase(Locale.ROOT);
+        if (s.endsWith(".txt")) s = s.substring(0, s.length() - 4);
+        if (s.endsWith(".us")) s = s.substring(0, s.length() - 3);
+        return normalize(s);
+    }
+
+    static String normalize(String ticker) {
+        return ticker.trim().toLowerCase(Locale.ROOT).replace('.', '-');
+    }
+
+    /** Adds tickers from free text: separated by commas/whitespace; '#' starts a comment line. */
+    private static void addAll(Set<String> tickers, String text) {
+        for (String line : text.split("\\R")) {
+            int hash = line.indexOf('#');
+            if (hash >= 0) line = line.substring(0, hash);
+            for (String t : line.split("[,\\s]+")) {
+                String n = normalize(t);
+                if (!n.isEmpty()) tickers.add(n);
+            }
+        }
     }
 
     private static String requireValue(String[] args, int idx, String opt) {
@@ -169,10 +188,11 @@ public final class StockExtractor {
 
     private static void printUsage() {
         System.err.println("""
-                Usage: java -jar stock-extractor.jar -z <file.zip> [-o <outDir>] [-p] <TICKER>...
+                Usage: java -jar stock-extractor.jar -z <file.zip> [-o <outDir>] [-p] [<TICKER>...]
 
                   -z, --zip <file>        Path to the zip (e.g. d_us_txt.zip)   [required]
                   -o, --out <dir>         Output directory (default: ./output)
+                  -f, --tickers-file <f>  Read tickers from a file (one per line or comma-separated, # comments)
                   -p, --preserve-paths    Keep the folder structure from the zip (default: flat)
                   -h, --help              Show this help
 
