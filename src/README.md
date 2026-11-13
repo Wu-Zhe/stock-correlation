@@ -12,7 +12,15 @@ The program:
 - fits a long-only fully invested basket for the selected target;
 - keeps hourly and five-minute data out of the core replacement signal.
 
-## Compile and run
+## Maven build, tests, and coverage
+
+```bash
+mvn -B -ntp verify
+```
+
+The build runs JUnit 5 tests and fails if either line or instruction coverage is below 90%. The HTML report is generated at `target/site/jacoco/index.html`.
+
+## Compile and run manually
 
 From the repository root:
 
