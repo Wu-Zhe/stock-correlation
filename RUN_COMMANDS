@@ -1,0 +1,12 @@
+
+# build
+	zhewu@Zhes-MacBook-Air stock-correlation % mvn clean package
+
+
+# simple test
+	java -jar target/stock-correlation.jar \
+	  --data-dir /Users/zhewu/data/stocks/20261109 \
+	  --tickers AAPL,MSFT,GOOG \
+	  --target AAPL
+
+
