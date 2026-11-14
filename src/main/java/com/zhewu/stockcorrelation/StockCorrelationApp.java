@@ -51,6 +51,7 @@ public final class StockCorrelationApp {
     private static final int DEFAULT_MIN_OVERLAP = 252;
     private static final double DEFAULT_HALF_LIFE = 126.0;
     private static final int TRADING_DAYS_PER_YEAR = 252;
+    static final int TAIL_WINDOW_DAYS = 21;
     private static final DateTimeFormatter DATE = DateTimeFormatter.BASIC_ISO_DATE;
 
     private StockCorrelationApp() {}
@@ -131,6 +132,12 @@ public final class StockCorrelationApp {
         Frequency frequency() { return frequency; }
         List<PriceBar> bars() { return bars; }
         NavigableMap<LocalDateTime, Double> closes() { return Collections.unmodifiableNavigableMap(closes); }
+
+        /** Returns a series holding only the newest {@code maxBars} bars; 0 keeps every bar. */
+        Series newest(int maxBars) {
+            if (maxBars <= 0 || bars.size() <= maxBars) return this;
+            return new Series(ticker, frequency, bars.subList(bars.size() - maxBars, bars.size()));
+        }
     }
 
     record Sample(String zipName, String entryName, List<PriceBar> rows) {}
@@ -183,7 +190,9 @@ public final class StockCorrelationApp {
                     LoadedSeries prior = selected.get(ticker);
                     if (prior != null && prior.sourceScore() > score) continue;
 
-                    Series series = readEntry(zip, entry, ticker, maxRowsPerSeries);
+                    // Read the whole entry, then keep the newest rows after sorting by
+                    // timestamp. Truncating in file order would keep the oldest history.
+                    Series series = readEntry(zip, entry, ticker, 0).newest(maxRowsPerSeries);
                     if (!series.bars().isEmpty()) {
                         selected.put(ticker, new LoadedSeries(score, series));
                     }
@@ -363,8 +372,10 @@ public final class StockCorrelationApp {
 
                 PairStats stats = pairStats(sourceSeries, entry.getValue(), halfLife);
                 if (stats == null || stats.observations() < minimumOverlap) continue;
+                // Too few aligned returns for a 21-day tail estimate: insufficient data, not a rankable score.
+                if (!Double.isFinite(stats.tail95Abs21Day())) continue;
                 double score = stats.trackingError()
-                        + 0.25 * stats.tail95Abs21Day() * Math.sqrt(TRADING_DAYS_PER_YEAR / 21.0);
+                        + 0.25 * stats.tail95Abs21Day() * Math.sqrt((double) TRADING_DAYS_PER_YEAR / TAIL_WINDOW_DAYS);
                 Candidate candidate = new Candidate(source, replacement, stats.observations(),
                         stats.correlation(), stats.trackingError(), stats.tail95Abs21Day(), score);
                 if (!sourceGroup.isBlank()
@@ -413,7 +424,7 @@ public final class StockCorrelationApp {
             double[] right = toArray(bValues);
             WeightedMoments moments = weightedMoments(left, right, halfLife);
             double annualizer = Math.sqrt(TRADING_DAYS_PER_YEAR);
-            double tail = tail95AbsDifference(left, right, 21);
+            double tail = tail95AbsDifference(left, right, TAIL_WINDOW_DAYS);
             return new PairStats(left.length, Math.sqrt(moments.varA()) * annualizer,
                     Math.sqrt(moments.varB()) * annualizer, moments.correlation(),
                     Math.sqrt(Math.max(0.0, moments.varDifference())) * annualizer, tail);
@@ -674,10 +685,24 @@ public final class StockCorrelationApp {
      * must be monitored together, including any spouse/IRA/DRIP scope required
      * by its tax policy. This class does not determine whether two instruments
      * are substantially identical; that decision belongs in Compliance data.
+     *
+     * The ledger consumes that Compliance data: an event on either side of a
+     * related pair (for example GOOG and GOOGL) conflicts with the other ticker.
+     * This is a research control only and needs professional tax review.
      */
     static final class TaxLedger {
         private static final long WINDOW_DAYS = 30L;
         private final Map<String, List<TaxEvent>> eventsByAccountFamily = new HashMap<>();
+        private final Set<String> relatedPairs;
+
+        /** Uses {@link Compliance#defaultBlockedPairs()} as the related-instrument list. */
+        TaxLedger() {
+            this(Compliance.defaultBlockedPairs());
+        }
+
+        TaxLedger(Set<String> relatedPairs) {
+            this.relatedPairs = Set.copyOf(Objects.requireNonNull(relatedPairs, "relatedPairs"));
+        }
 
         void recordPurchase(String accountFamily, String ticker, LocalDate date,
                             double quantity, boolean automated) {
@@ -701,7 +726,7 @@ public final class StockCorrelationApp {
             String normalized = ZipPriceReader.normalize(ticker);
             return events(accountFamily).stream().noneMatch(event ->
                     event.type() == TaxEventType.LOSS_SALE
-                            && event.ticker().equals(normalized)
+                            && related(event.ticker(), normalized)
                             && withinPriorWindow(event.date(), purchaseDate));
         }
 
@@ -710,7 +735,7 @@ public final class StockCorrelationApp {
             String normalized = ZipPriceReader.normalize(ticker);
             return events(accountFamily).stream().noneMatch(event ->
                     event.type() == TaxEventType.PURCHASE
-                            && event.ticker().equals(normalized)
+                            && related(event.ticker(), normalized)
                             && withinPriorWindow(event.date(), saleDate));
         }
 
@@ -718,11 +743,16 @@ public final class StockCorrelationApp {
             String normalized = ZipPriceReader.normalize(ticker);
             List<String> reasons = new ArrayList<>();
             for (TaxEvent event : events(accountFamily)) {
-                if (!event.ticker().equals(normalized) || !withinPriorWindow(event.date(), date)) continue;
+                if (!related(event.ticker(), normalized) || !withinPriorWindow(event.date(), date)) continue;
                 reasons.add(event.type().name().toLowerCase(Locale.ROOT)
+                        + (event.ticker().equals(normalized) ? "" : " of " + event.ticker())
                         + " on " + event.date() + (event.automated() ? " (automated)" : ""));
             }
             return List.copyOf(reasons);
+        }
+
+        private boolean related(String eventTicker, String ticker) {
+            return eventTicker.equals(ticker) || Compliance.blocked(eventTicker, ticker, relatedPairs);
         }
 
         private void add(TaxEvent event) {
@@ -841,7 +871,8 @@ public final class StockCorrelationApp {
                 }
             }
 
-            System.out.println("\nIntraday data was sampled for input validation only; hourly and five-minute series are not used as core replacement signals.");
+            System.out.println("\nNo tax-ledger or wash-sale check was run; candidates are statistical research output only.");
+            System.out.println("Intraday data was sampled for input validation only; hourly and five-minute series are not used as core replacement signals.");
         }
 
         private static void printSample(Frequency frequency, Sample sample) {
@@ -902,6 +933,10 @@ public final class StockCorrelationApp {
             if (sampleRows <= 0 || topK <= 0 || minOverlap <= 1 || halfLife <= 0.0) {
                 throw new IllegalArgumentException("invalid positive configuration");
             }
+            if (minOverlap < TAIL_WINDOW_DAYS) {
+                throw new IllegalArgumentException("--min-overlap must be at least "
+                        + TAIL_WINDOW_DAYS + " for the tail-divergence check");
+            }
             return new Config(dataDir.toAbsolutePath().normalize(), tickers, target, sampleRows,
                     analysisRows, topK, minOverlap, halfLife, List.copyOf(blockedPairs), help);
         }
@@ -949,9 +984,9 @@ public final class StockCorrelationApp {
                       --tickers <list>       Comma/space-separated tickers (default: AAPL,MSFT,GOOG)
                       --target <ticker>      Basket report target (default: first loaded ticker)
                       --sample-rows <n>      Rows sampled from each ZIP (default: 100)
-                      --analysis-rows <n>    Daily rows used; 0 means all selected history (default: 0)
+                      --analysis-rows <n>    Newest daily rows used; 0 means all history (default: 0)
                       --top-k <n>             Candidates per stock (default: 5)
-                      --min-overlap <n>       Minimum shared returns (default: 252)
+                      --min-overlap <n>       Minimum shared returns, at least 21 (default: 252)
                       --half-life <days>      EWMA half-life (default: 126)
                       --blocked-pair A:B      Additional issuer/compliance exclusion; repeatable
                       -h, --help              Show this help

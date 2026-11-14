@@ -36,6 +36,10 @@ java -cp /tmp/stock-correlation-out \
   --target AAPL
 ```
 
-`--analysis-rows 0` reads all selected daily history. Set it to a positive value for a bounded smoke test. `--sample-rows 100` controls the input sample displayed for each of the three ZIP files.
+`--analysis-rows 0` reads all selected daily history. Set it to a positive value to keep only the newest N daily bars per ticker (bars are sorted by timestamp first, so unsorted files still keep the most recent history). `--sample-rows 100` controls the input sample displayed for each of the three ZIP files.
+
+`--min-overlap` must be at least 21, the tail-divergence window. Pairs with fewer aligned returns than that window are skipped as insufficient data rather than scored.
+
+`TaxLedger` treats tickers in the Compliance related-pair list (default: GOOG/GOOGL, FOX/FOXA, NWS/NWSA, BRK.A/BRK.B) as conflicting with each other in the 30-day windows. The CLI does not yet run any tax-ledger check and prints a notice saying so. Tax logic is a research control only and needs professional review before any live use.
 
 This is a research implementation. A live system still needs point-in-time index membership, issuer metadata, transaction-cost calibration, lot-level cross-account wash-sale controls, factor constraints, and walk-forward validation.

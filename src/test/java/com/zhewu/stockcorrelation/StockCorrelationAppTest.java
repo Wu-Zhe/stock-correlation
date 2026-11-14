@@ -88,6 +88,58 @@ class StockCorrelationAppTest {
     }
 
     @Test
+    void analysisRowLimitKeepsNewestBarsEvenWhenFileIsUnsorted() throws Exception {
+        String sorted = dailyRows("AAPL.US", 10, 100.0);
+        String[] lines = sorted.split("\n");
+        StringBuilder reversed = new StringBuilder(HEADER);
+        for (int i = lines.length - 1; i >= 1; i--) reversed.append(lines[i]).append('\n');
+        Path zip = writeZip(Map.of("data/daily/us/nasdaq stocks/1/aapl.us.txt", reversed.toString()));
+
+        StockCorrelationApp.ZipPriceReader reader = new StockCorrelationApp.ZipPriceReader();
+        StockCorrelationApp.Series newest = reader.readSeries(zip, Set.of("aapl"), 3).get("aapl");
+        assertEquals(3, newest.bars().size());
+        assertEquals(LocalDate.of(2024, 1, 8), newest.bars().get(0).timestamp().toLocalDate());
+        assertEquals(LocalDate.of(2024, 1, 10), newest.bars().get(2).timestamp().toLocalDate());
+
+        StockCorrelationApp.Series all = reader.readSeries(zip, Set.of("aapl"), 0).get("aapl");
+        assertEquals(10, all.bars().size());
+        assertTrue(all == all.newest(0) && all == all.newest(10));
+    }
+
+    @Test
+    void rankingSkipsPairsTooShortForTailEstimate() {
+        Map<String, StockCorrelationApp.Series> universe = new LinkedHashMap<>();
+        universe.put("aapl", syntheticSeries("aapl", 15, 100.0, 0.006, 0.0));
+        universe.put("msft", syntheticSeries("msft", 15, 200.0, 0.006, 0.0002));
+        assertTrue(StockCorrelationApp.RiskEngine.rank("aapl", universe, Set.of(), Map.of(),
+                2, 5, 126.0).isEmpty());
+    }
+
+    @Test
+    void taxLedgerTreatsRelatedShareClassesAsConflicts() {
+        StockCorrelationApp.TaxLedger ledger = new StockCorrelationApp.TaxLedger();
+        LocalDate date = LocalDate.of(2026, 3, 2);
+
+        ledger.recordLossSale("family", "GOOG", date, 1.0, 50.0);
+        assertFalse(ledger.canPurchase("family", "GOOGL", date.plusDays(1)));
+        assertTrue(ledger.canPurchase("family", "GOOGL", date.plusDays(31)));
+        assertTrue(ledger.canPurchase("family", "MSFT", date.plusDays(1)));
+        assertTrue(ledger.activeReasons("family", "GOOGL", date.plusDays(1)).get(0).contains("of goog"));
+
+        ledger.recordPurchase("family", "BRK.A", date, 1.0, false);
+        assertFalse(ledger.canHarvest("family", "brk-b", date.plusDays(5)));
+
+        Set<String> custom = new java.util.HashSet<>();
+        StockCorrelationApp.Compliance.add(custom, "AAPL", "MSFT");
+        StockCorrelationApp.TaxLedger customLedger = new StockCorrelationApp.TaxLedger(custom);
+        customLedger.recordLossSale("family", "AAPL", date, 1.0, 10.0);
+        assertFalse(customLedger.canPurchase("family", "MSFT", date.plusDays(1)));
+        customLedger.recordLossSale("family", "GOOG", date, 1.0, 10.0);
+        assertTrue(customLedger.canPurchase("family", "GOOGL", date.plusDays(1)));
+        assertThrows(NullPointerException.class, () -> new StockCorrelationApp.TaxLedger(null));
+    }
+
+    @Test
     void pairStatisticsUseAlignedReturnsAndTailRisk() {
         StockCorrelationApp.Series source = syntheticSeries("aapl", 320, 100.0, 0.006, 0.0002);
         StockCorrelationApp.Series peer = syntheticSeries("msft", 320, 200.0, 0.006, 0.0002);
@@ -180,7 +232,7 @@ class StockCorrelationAppTest {
                 "--sample-rows", "3",
                 "--analysis-rows", "10",
                 "--top-k", "2",
-                "--min-overlap", "5",
+                "--min-overlap", "21",
                 "--half-life", "7",
                 "--blocked-pair", "AAPL:MSFT"
         });
@@ -189,7 +241,7 @@ class StockCorrelationAppTest {
         assertEquals(3, config.sampleRows());
         assertEquals(10, config.analysisRows());
         assertEquals(2, config.topK());
-        assertEquals(5, config.minimumOverlap());
+        assertEquals(21, config.minimumOverlap());
         assertEquals(7.0, config.halfLife(), 1e-9);
         assertEquals(List.of("AAPL:MSFT"), config.blockedPairs());
 
@@ -207,6 +259,9 @@ class StockCorrelationAppTest {
                 () -> StockCorrelationApp.Config.parse(new String[] {"--top-k", "0"}));
         assertThrows(IllegalArgumentException.class,
                 () -> StockCorrelationApp.Config.parse(new String[] {"--min-overlap", "1"}));
+        IllegalArgumentException shortOverlap = assertThrows(IllegalArgumentException.class,
+                () -> StockCorrelationApp.Config.parse(new String[] {"--min-overlap", "20"}));
+        assertTrue(shortOverlap.getMessage().contains("21"));
         assertThrows(IllegalArgumentException.class,
                 () -> StockCorrelationApp.Config.parse(new String[] {"--half-life", "0"}));
         assertThrows(IllegalArgumentException.class,
